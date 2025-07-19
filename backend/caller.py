@@ -3,16 +3,16 @@ import requests
 from twilio.rest import Client
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv('.env.local')
 
-def make_interactive_call(phone_number: str):
+def make_interactive_call(phone_number: str, test_mode: bool = False):
     """Make an interactive call using the new voice system"""
     
     # First option: Use the FastAPI endpoint
     try:
         base_url = os.environ.get("BASE_URL", "http://localhost:8000")
         response = requests.post(f"{base_url}/make-call", 
-                               params={"phone_number": phone_number})
+                               params={"phone_number": phone_number, "test_mode": test_mode})
         
         if response.status_code == 200:
             result = response.json()
@@ -26,12 +26,12 @@ def make_interactive_call(phone_number: str):
     except requests.exceptions.ConnectionError:
         # Fallback: Direct Twilio call if API server is not running
         print("⚠️  API server not available, making direct call...")
-        return make_direct_call(phone_number)
+        return make_direct_call(phone_number, test_mode=test_mode)
     except Exception as e:
         print(f"❌ Error making call through API: {e}")
         return None
 
-def make_direct_call(phone_number: str):
+def make_direct_call(phone_number: str, test_mode: bool = False):
     """Make a direct Twilio call (fallback)"""
     
     account_sid = os.environ["TWILIO_ACCOUNT_SID"]
@@ -42,12 +42,23 @@ def make_direct_call(phone_number: str):
     client = Client(account_sid, auth_token)
     
     try:
+        if test_mode:
+            twiml_url = "http://demo.twilio.com/docs/voice.xml"
+        else:
+            # Add ngrok-skip-browser-warning parameter for free ngrok accounts
+            if 'ngrok' in base_url:
+                twiml_url = f"{base_url}/voice/greeting?ngrok-skip-browser-warning=true"
+                status_callback_url = f"{base_url}/voice/status?ngrok-skip-browser-warning=true"
+            else:
+                twiml_url = f"{base_url}/voice/greeting"
+                status_callback_url = f"{base_url}/voice/status"
+        
         call = client.calls.create(
             from_=twilio_number,
             to=phone_number,
-            url=f"{base_url}/voice/greeting",
+            url=twiml_url,
             method="POST",
-            status_callback=f"{base_url}/voice/status",
+            status_callback=status_callback_url,
             status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
             status_callback_method="POST"
         )

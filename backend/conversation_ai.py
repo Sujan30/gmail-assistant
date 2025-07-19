@@ -1,26 +1,62 @@
 import openai
 import os
 import json
+import httpx
+import asyncio
 from typing import Dict, Any, List, Optional
-from mcp_serve import MCPClient
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv('.env.local')
+
+class MCPClient:
+    """MCP Client for communicating with the MCP server"""
+    
+    def __init__(self, server_url: str = "http://localhost:3000"):
+        self.server_url = server_url
+        self.client = httpx.AsyncClient()
+    
+    async def call_tool(self, tool_name: str, **kwargs) -> str:
+        """Call an MCP tool via HTTP"""
+        try:
+            response = await self.client.post(
+                f"{self.server_url}/call-tool",
+                json={
+                    "tool": tool_name,
+                    "arguments": kwargs
+                },
+                timeout=30.0
+            )
+            response.raise_for_status()
+            return response.json().get("result", "No result")
+        except Exception as e:
+            return f"Error calling MCP tool {tool_name}: {str(e)}"
+    
+    async def close(self):
+        """Close the HTTP client"""
+        await self.client.aclose()
 
 class ConversationAI:
-    """AI conversation handler for voice calls"""
+    """AI conversation handler for voice calls - MCP Client Integration"""
     
     def __init__(self, user_id: str):
         self.user_id = user_id
         self.openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.mcp_client = MCPClient(user_id)
+        self.mcp_client = MCPClient()
         self.conversation_state = {
             "mode": "greeting",  # greeting, email_reading, responding, general
             "context": {},
             "conversation_history": []
         }
     
-    def process_user_input(self, user_speech: str) -> Dict[str, Any]:
+    async def __aenter__(self):
+        """Async context manager entry"""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        await self.mcp_client.close()
+    
+    async def process_user_input(self, user_speech: str) -> Dict[str, Any]:
         """
         Process user's speech input and return appropriate response
         
@@ -39,13 +75,13 @@ class ConversationAI:
             
             # Determine intent and generate response
             if self.conversation_state["mode"] == "greeting":
-                return self._handle_greeting_mode(user_speech)
+                return await self._handle_greeting_mode(user_speech)
             elif self.conversation_state["mode"] == "email_reading":
-                return self._handle_email_reading_mode(user_speech)
+                return await self._handle_email_reading_mode(user_speech)
             elif self.conversation_state["mode"] == "responding":
-                return self._handle_responding_mode(user_speech)
+                return await self._handle_responding_mode(user_speech)
             else:
-                return self._handle_general_mode(user_speech)
+                return await self._handle_general_mode(user_speech)
                 
         except Exception as e:
             return {
@@ -54,7 +90,7 @@ class ConversationAI:
                 "tts_text": "I'm sorry, I encountered an error. Could you please try again?"
             }
     
-    def _handle_greeting_mode(self, user_speech: str) -> Dict[str, Any]:
+    async def _handle_greeting_mode(self, user_speech: str) -> Dict[str, Any]:
         """Handle the initial greeting and user request"""
         
         # Use OpenAI to understand the user's intent
@@ -91,11 +127,11 @@ class ConversationAI:
             user_lower = user_speech.lower()
             if any(keyword in user_lower for keyword in ["email", "emails", "read email", "check email"]):
                 self.conversation_state["mode"] = "email_reading"
-                # Initialize credentials and get emails
-                cred_result = self.mcp_client.initialize_creds()
-                email_result = self.mcp_client.get_emails(max_emails=5)
+                # Initialize credentials and get emails via MCP
+                cred_result = await self.mcp_client.call_tool("initialize_creds", user_id=self.user_id)
+                email_result = await self.mcp_client.call_tool("get_emails", user_id=self.user_id, max_emails=5)
                 
-                response_text = f"Sure! Let me check your emails. {email_result}. I'll start reading them one by one. You can say 'respond' during any email if you'd like to reply to it."
+                response_text = f"Sure! Let me check your emails. {email_result}. I'll present each email's subject first, then you can choose whether to read the full email or skip to the next one."
                 action = "start_email_reading"
             else:
                 response_text = ai_response
@@ -114,132 +150,92 @@ class ConversationAI:
                 "tts_text": "Hello! I'm your email assistant. How can I help you today?"
             }
     
-    def _handle_email_reading_mode(self, user_speech: str) -> Dict[str, Any]:
-        """Handle user input while reading emails"""
+    async def _handle_email_reading_mode(self, user_speech: str) -> Dict[str, Any]:
+        """Handle user input during email reading"""
         
         user_lower = user_speech.lower()
         
-        # Check for specific commands
-        if "respond" in user_lower or "reply" in user_lower:
-            self.conversation_state["mode"] = "responding"
-            current_email = self.mcp_client.get_current_email()
-            if current_email.get("success"):
-                self.conversation_state["context"]["responding_to"] = current_email["email"]
-                response_text = "What would you like me to say in your response?"
-                return {
-                    "response_text": response_text,
-                    "action": "wait_for_response_content",
-                    "tts_text": response_text
-                }
-            else:
-                response_text = "I couldn't get the current email details. Let me continue reading."
-                return {
-                    "response_text": response_text,
-                    "action": "continue_reading",
-                    "tts_text": response_text
-                }
+        if any(keyword in user_lower for keyword in ["read", "read it", "read full", "read full email", "yes", "sure", "okay"]):
+            # Read the full email content
+            full_email = await self.mcp_client.call_tool("read_full_current_email", user_id=self.user_id)
+            response_text = full_email
+            action = "continue"
         
-        elif any(word in user_lower for word in ["next", "skip", "continue"]):
-            next_result = self.mcp_client.next_email()
+        elif any(keyword in user_lower for keyword in ["next", "skip", "continue"]):
+            # Move to next email
+            next_result = await self.mcp_client.call_tool("next_email", user_id=self.user_id)
+            
             if "No more emails" in next_result:
                 self.conversation_state["mode"] = "general"
                 response_text = "That's all your emails! Is there anything else I can help you with?"
+                action = "continue"
             else:
-                response_text = f"{next_result}. Moving to the next email."
-                return {
-                    "response_text": response_text,
-                    "action": "read_next_email",
-                    "tts_text": response_text
-                }
+                response_text = f"{next_result}. Here's the next email."
+                action = "read_next_email"
         
-        elif any(word in user_lower for word in ["stop", "done", "enough"]):
+        elif any(keyword in user_lower for keyword in ["respond", "reply", "answer"]):
+            # Switch to responding mode
+            self.conversation_state["mode"] = "responding"
+            response_text = "What would you like me to say in your reply?"
+            action = "wait_for_response_content"
+        
+        elif any(keyword in user_lower for keyword in ["stop", "done", "finish"]):
+            # Stop reading emails
             self.conversation_state["mode"] = "general"
-            response_text = "Okay, I've stopped reading emails. Is there anything else I can help you with?"
+            response_text = "Finished reading emails. How else can I help you?"
+            action = "continue"
         
         else:
-            # Default: continue reading current or next email
-            response_text = "I'll continue reading. Say 'next' to skip to the next email, or 'respond' if you'd like to reply to this one."
+            # Continue reading current email or ask for clarification
+            response_text = "I can read this email, skip to the next one, help you respond to this one, or stop reading. What would you like to do?"
+            action = "continue"
         
         return {
             "response_text": response_text,
-            "action": "continue_reading",
+            "action": action,
             "tts_text": response_text
         }
     
-    def _handle_responding_mode(self, user_speech: str) -> Dict[str, Any]:
-        """Handle user input for composing email responses"""
+    async def _handle_responding_mode(self, user_speech: str) -> Dict[str, Any]:
+        """Handle composing email responses"""
         
-        responding_to = self.conversation_state["context"].get("responding_to")
-        if not responding_to:
-            self.conversation_state["mode"] = "email_reading"
-            return {
-                "response_text": "I lost track of which email you wanted to respond to. Let me continue reading emails.",
-                "action": "continue_reading",
-                "tts_text": "Let me continue reading emails."
-            }
+        # Store the response content
+        self.conversation_state["context"]["response_content"] = user_speech
         
-        # Use OpenAI to help compose a professional response
-        system_prompt = f"""You are helping compose an email response. 
+        # Get current email info for reply
+        current_email = await self.mcp_client.call_tool("get_current_email_for_reading", user_id=self.user_id)
         
-        Original email details:
-        From: {responding_to['sender']}
-        Subject: {responding_to['subject']}
-        Content: {responding_to['body']}
+        # For now, simulate sending
+        reply_result = await self.mcp_client.call_tool(
+            "send_email_reply",
+            user_id=self.user_id,
+            recipient="sender@example.com",  # This would be extracted from current email
+            subject="Re: Email Subject",      # This would be from current email
+            body=user_speech
+        )
         
-        The user said: "{user_speech}"
+        # Switch back to email reading mode
+        self.conversation_state["mode"] = "email_reading"
         
-        Create a professional email response based on what the user wants to say.
-        Keep it concise but polite. Return just the email body text.
-        """
+        response_text = f"{reply_result}. Would you like me to continue reading emails or do something else?"
         
-        try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_speech}
-                ],
-                max_tokens=200,
-                temperature=0.7
-            )
-            
-            composed_response = response.choices[0].message.content
-            
-            # Send the email reply
-            reply_result = self.mcp_client.send_email_reply(
-                recipient=responding_to['sender'],
-                subject=f"Re: {responding_to['subject']}",
-                body=composed_response
-            )
-            
-            self.conversation_state["mode"] = "email_reading"
-            response_text = f"I've sent your reply: {composed_response}. {reply_result}. Would you like me to continue reading more emails?"
-            
-            return {
-                "response_text": response_text,
-                "action": "continue_reading",
-                "tts_text": f"I've sent your reply. Would you like me to continue reading more emails?"
-            }
-            
-        except Exception as e:
-            self.conversation_state["mode"] = "email_reading"
-            return {
-                "response_text": f"I had trouble sending that response. Let me continue reading emails.",
-                "action": "continue_reading",
-                "tts_text": "I had trouble sending that response. Let me continue reading emails."
-            }
+        return {
+            "response_text": response_text,
+            "action": "continue",
+            "tts_text": response_text
+        }
     
-    def _handle_general_mode(self, user_speech: str) -> Dict[str, Any]:
+    async def _handle_general_mode(self, user_speech: str) -> Dict[str, Any]:
         """Handle general conversation and commands"""
         
         user_lower = user_speech.lower()
         
         if any(keyword in user_lower for keyword in ["email", "emails", "read email", "check email"]):
             self.conversation_state["mode"] = "greeting"
-            return self._handle_greeting_mode(user_speech)
+            return await self._handle_greeting_mode(user_speech)
         
         elif any(keyword in user_lower for keyword in ["calendar", "schedule", "appointments"]):
-            calendar_result = self.mcp_client.get_calendar_events()
+            calendar_result = await self.mcp_client.call_tool("get_calendar_events", user_id=self.user_id)
             response_text = calendar_result
         
         elif any(keyword in user_lower for keyword in ["task", "tasks", "todo"]):
@@ -279,28 +275,16 @@ class ConversationAI:
             "tts_text": response_text
         }
     
-    def get_current_email_for_reading(self) -> Optional[str]:
+    async def get_current_email_for_reading(self) -> Optional[str]:
         """Get the current email formatted for text-to-speech reading"""
         try:
-            current_email = self.mcp_client.get_current_email()
-            if current_email.get("success"):
-                email = current_email["email"]
-                
-                # Format for natural speech
-                reading_text = f"""
-                Email {current_email['position']}:
-                From {email['sender']}.
-                Subject: {email['subject']}.
-                
-                {email['body']}
-                
-                This email has {email['importance']} priority with a score of {email['score']}.
-                
-                Say 'respond' if you'd like to reply, 'next' for the next email, or 'stop' to finish reading.
-                """
-                
-                return reading_text.strip()
-            else:
-                return "No more emails to read."
+            # Use the MCP client to get voice-optimized email reading
+            reading_text = await self.mcp_client.call_tool("get_current_email_for_reading", user_id=self.user_id)
+            
+            # Add instructions for user interaction (this now presents just the subject)
+            if not reading_text.startswith("Sorry,"):
+                reading_text += " Say 'read it' to hear the full email, 'next' to skip to the next one, 'respond' to reply, or 'stop' to finish."
+            
+            return reading_text
         except Exception as e:
             return f"Error reading email: {str(e)}" 

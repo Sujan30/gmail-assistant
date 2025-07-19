@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from typing import Dict, Any
 import logging
 
-load_dotenv()
+load_dotenv('.env.local')
 
 class VoiceHandler:
     """Handles Twilio voice interactions and TwiML responses"""
@@ -19,29 +19,44 @@ class VoiceHandler:
         )
         self.conversation_sessions = {}  # Store conversation states per call
         
-    def initiate_call(self, to_number: str) -> str:
+    def initiate_call(self, to_number: str, test_mode: bool = False) -> str:
         """Initiate an outbound call"""
         try:
+            if test_mode:
+                # For testing: use a simple TwiML that just says hello
+                twiml_url = "http://demo.twilio.com/docs/voice.xml"
+            else:
+                base_url = os.environ.get('BASE_URL', 'http://localhost:8000')
+                # Add ngrok-skip-browser-warning parameter for free ngrok accounts
+                if 'ngrok' in base_url:
+                    twiml_url = f"{base_url}/voice/greeting?ngrok-skip-browser-warning=true"
+                else:
+                    twiml_url = f"{base_url}/voice/greeting"
+            
             call = self.twilio_client.calls.create(
                 from_=os.environ["TWILIO_NUMBER"],
                 to=to_number,
-                url=f"{os.environ.get('BASE_URL', 'http://localhost:8000')}/voice/greeting",
+                url=twiml_url,
                 method="POST"
             )
+            
             return call.sid
         except Exception as e:
             logging.error(f"Error initiating call: {e}")
             raise
     
-    def handle_greeting(self, request: Request) -> str:
+    async def handle_greeting(self, request: Request) -> str:
         """Handle initial call greeting"""
         response = VoiceResponse()
         
         # Get or create conversation session
-        call_sid = request.form.get('CallSid')
-        caller_number = request.form.get('From')
+        form_data = await request.form()
+        call_sid = form_data.get('CallSid')
+        caller_number = form_data.get('From')
         
         if call_sid not in self.conversation_sessions:
+            # Note: ConversationAI is now an async context manager, but we'll manage it manually
+            # in the voice handler since we need to persist sessions across requests
             self.conversation_sessions[call_sid] = ConversationAI(user_id=caller_number)
         
         # Welcome message
@@ -68,12 +83,13 @@ class VoiceHandler:
         
         return str(response)
     
-    def process_user_input(self, request: Request) -> str:
+    async def process_user_input(self, request: Request) -> str:
         """Process user speech input and generate appropriate response"""
         response = VoiceResponse()
         
-        call_sid = request.form.get('CallSid')
-        speech_result = request.form.get('SpeechResult', '')
+        form_data = await request.form()
+        call_sid = form_data.get('CallSid')
+        speech_result = form_data.get('SpeechResult', '')
         
         if call_sid not in self.conversation_sessions:
             # Session lost, restart
@@ -84,8 +100,8 @@ class VoiceHandler:
         conversation_ai = self.conversation_sessions[call_sid]
         
         try:
-            # Process the user input
-            ai_response = conversation_ai.process_user_input(speech_result)
+            # Process the user input with async call
+            ai_response = await conversation_ai.process_user_input(speech_result)
             
             # Handle different actions
             if ai_response["action"] == "end_call":
@@ -139,16 +155,18 @@ class VoiceHandler:
         
         except Exception as e:
             logging.error(f"Error processing user input: {e}")
+            logging.exception("Full exception details:")
             response.say("I'm sorry, I encountered an error. Let me try again.", voice='alice')
             response.redirect('/voice/greeting')
         
         return str(response)
     
-    def read_current_email(self, request: Request) -> str:
+    async def read_current_email(self, request: Request) -> str:
         """Read the current email to the user"""
         response = VoiceResponse()
         
-        call_sid = request.form.get('CallSid')
+        form_data = await request.form()
+        call_sid = form_data.get('CallSid')
         
         if call_sid not in self.conversation_sessions:
             response.say("I'm sorry, I lost our conversation. Let me restart.", voice='alice')
@@ -158,8 +176,8 @@ class VoiceHandler:
         conversation_ai = self.conversation_sessions[call_sid]
         
         try:
-            # Get current email for reading
-            email_text = conversation_ai.get_current_email_for_reading()
+            # Get current email for reading with async call
+            email_text = await conversation_ai.get_current_email_for_reading()
             
             if email_text:
                 # Read the email
@@ -195,20 +213,29 @@ class VoiceHandler:
         
         except Exception as e:
             logging.error(f"Error reading email: {e}")
+            logging.exception("Full exception details:")
             response.say("I had trouble reading that email. Let me try the next one.", voice='alice')
             response.redirect('/voice/process_input')
         
         return str(response)
     
-    def handle_call_status(self, request: Request) -> str:
+    async def handle_call_status(self, request: Request) -> str:
         """Handle call status updates"""
-        call_sid = request.form.get('CallSid')
-        call_status = request.form.get('CallStatus')
+        form_data = await request.form()
+        call_sid = form_data.get('CallSid')
+        call_status = form_data.get('CallStatus')
         
         logging.info(f"Call {call_sid} status: {call_status}")
         
         # Clean up session when call ends
         if call_status in ['completed', 'failed', 'busy', 'no-answer'] and call_sid in self.conversation_sessions:
+            conversation_ai = self.conversation_sessions[call_sid]
+            # Properly close the async context manager
+            try:
+                await conversation_ai.__aexit__(None, None, None)
+            except Exception as e:
+                logging.error(f"Error closing ConversationAI session: {e}")
+            
             del self.conversation_sessions[call_sid]
             logging.info(f"Cleaned up session for call {call_sid}")
         

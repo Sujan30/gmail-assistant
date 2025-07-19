@@ -77,30 +77,46 @@ def test_call():
         print("❌ No phone number provided!")
         return False
     
+    # Ask for test mode
+    if not server_running:
+        print("\n⚠️  Server not running - enabling test mode automatically")
+        test_mode = True
+    else:
+        test_choice = input("\n🧪 Use test mode? (y/n) [Test mode uses demo TwiML instead of webhooks]: ").lower()
+        test_mode = test_choice.startswith('y')
+    
     print(f"\n📞 Initiating call to {phone_number}...")
     
-    if server_running:
-        print("🚀 Using API server method...")
+    if test_mode:
+        print("🧪 Using TEST MODE (demo TwiML - will just say hello)")
+    elif server_running:
+        print("🚀 Using API server method with full assistant features...")
     else:
         print("⚠️  Using direct Twilio method (server not running)...")
     
     # Make the call
-    call_sid = make_interactive_call(phone_number)
+    call_sid = make_interactive_call(phone_number, test_mode=test_mode)
     
     if call_sid:
         print(f"\n🎉 SUCCESS! Call initiated with SID: {call_sid}")
         print("\n📱 You should receive a call shortly!")
-        print("\n💬 When you answer, try saying:")
-        print("   • 'Hello' or 'Hi'")
-        print("   • 'Read my emails'")
-        print("   • 'Check my calendar'")
-        print("   • 'Help me with tasks'")
-        print("\n🔄 During email reading:")
-        print("   • Say 'respond' to reply to an email")
-        print("   • Say 'next' to skip to the next email")
-        print("   • Say 'stop' to finish reading")
-        print("\n✋ To end the call:")
-        print("   • Say 'goodbye', 'bye', or 'done'")
+        
+        if test_mode:
+            print("\n🧪 TEST MODE: The call will just play a demo message")
+            print("💡 To use full features, set up ngrok and restart without test mode")
+        else:
+            print("\n💬 When you answer, try saying:")
+            print("   • 'Hello' or 'Hi'")
+            print("   • 'Read my emails'")
+            print("   • 'Check my calendar'")
+            print("   • 'Help me with tasks'")
+            print("\n🔄 During email reading:")
+            print("   • Say 'read it' to hear the full email")
+            print("   • Say 'next' to skip to the next email")
+            print("   • Say 'respond' to reply to an email")
+            print("   • Say 'stop' to finish reading")
+            print("\n✋ To end the call:")
+            print("   • Say 'goodbye', 'bye', or 'done'")
         
         return True
     else:
@@ -111,9 +127,11 @@ def test_call():
         print("3. Verify your phone number format (+1234567890)")
         print("4. Check your Twilio account balance")
         
-        if not server_running:
+        if not server_running and not test_mode:
             print("5. Start the server: python app.py")
             print("6. Set up webhooks for production use")
+        
+        print("\n💡 For webhook issues, use ngrok or try test mode")
         
         return False
 
